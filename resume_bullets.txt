@@ -1,0 +1,15 @@
+Led a year-long, faculty-advised research project applying quantum machine learning to financial portfolio optimization, using a rigorous, data-driven approach to model design and validation.
+Developed, debugged, and benchmarked neural network models on quantum and classical hardware using Qiskit, PyTorch, and scikit-learn, applying systematic root-cause analysis to isolate and correct sources of error in model output.
+Analyzed model performance data to characterize behavior under varying market conditions, translating statistical findings into targeted, data-driven process adjustments.
+Evaluated pricing, performance, and reliability trade-offs of single-board computers for aerospace-grade applications, supporting equipment and material selection criteria under real-world operating constraints.
+Prototyped and physically validated commercial product designs, producing investor-facing 3D models and printed prototypes to verify design intent and quality before build.
+Contributed to a faculty-led government transparency initiative involving large-scale legislative data aggregation across federal, state, and local sources.
+Built and systematically debugged Node.js web scrapers (axios, cheerio, dotenv) across varied site environments, structuring output in JSON for downstream AI processing.
+Reviewed AI-generated code across multiple languages for correctness, performing root-cause debugging of logic errors and flagging safety/quality violations.
+Conducted quantitative data analysis using pandas (Python) to support quality workflows, identify statistical patterns in review outcomes, and inform process improvement recommendations.
+Designed and simulated digital logic in VHDL on Xilinx Basys 3 and Artix-7 FPGA boards, covering digital system design and computer organization coursework.
+Programmed embedded systems hardware including the TI MSP430 in RISC/C/Assembly, plus Raspberry Pi-based interfacing projects.
+Completed CodePath's Intermediate Cybersecurity Program, covering threat identification and mitigation, Linux terminal literacy, and practical use of Wireshark and Splunk.
+Built a local, Ollama-powered job application tracker (AIUpkeep) that audits a tracked-application index against the filesystem, checks live posting status via HTTP, and cleans up closed applications automatically.
+Built a real retrieval-augmented generation (RAG) pipeline that embeds resume content locally via an Ollama embedding model and retrieves the most relevant experience for a given job description.
+Orchestrated a local LLM workflow end-to-end in n8n: a scheduled trigger runs the application-status checker, an HTTP Request node summarizes the results through a local Ollama model, and the summary is logged automatically.

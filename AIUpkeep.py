@@ -4,7 +4,7 @@ AIUpkeep — job application tracker upkeep.
 
 Three-stage run, in order:
 
-  1. RAG AUDIT — every row in Index.xls is checked against the actual
+  1. INDEX AUDIT — every row in Index.xls is checked against the actual
      filesystem. Any resume the index points to that doesn't exist gets
      flagged, and any resume sitting in the Resumes folder that no row
      points to gets flagged too.
@@ -17,13 +17,21 @@ Three-stage run, in order:
      careers site the Link points to.
 
   3. SUMMARY — count.xls is rewritten to match the number of rows left in
-     Index.xls, and a one-line summary is printed.
+     Index.xls, and a one-line summary is printed (and optionally written
+     as JSON via --json-summary, for automation tools to consume).
+
+Note: this script's "index audit" is a plain filesystem consistency check,
+not retrieval-augmented generation — that naming was a leftover from an
+earlier draft. For an actual RAG pipeline (embedding resume bullets and
+retrieving the ones most relevant to a job posting), see resume_rag.py.
 """
 
 import argparse
 import csv
+import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -75,11 +83,11 @@ def save_count(count_path: Path, value: int):
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 — RAG audit: index vs. filesystem
+# Stage 1 — index audit: Index.xls vs. filesystem
 # ---------------------------------------------------------------------------
 
-def rag_audit(rows: list[dict], resume_dir: Path):
-    print("=== Stage 1: RAG audit (index vs. filesystem) ===")
+def index_audit(rows: list[dict], resume_dir: Path):
+    print("=== Stage 1: index audit (Index.xls vs. filesystem) ===")
 
     indexed_paths = set()
     missing = []
@@ -186,6 +194,26 @@ def check_and_clean(rows: list[dict], dry_run: bool) -> list[dict]:
     return kept, removed
 
 
+def write_json_summary(json_path: Path, *, checked: int, active: int, removed: int,
+                        missing: list[dict], orphans: list, dry_run: bool):
+    """
+    Writes a machine-readable summary alongside the human-readable console output —
+    this is what an automation tool (n8n, cron + curl, etc.) reads instead of
+    scraping stdout.
+    """
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "dry_run": dry_run,
+        "checked": checked,
+        "active": active,
+        "closed_removed": removed,
+        "missing_resumes": [row.get("File Address", "") for row in missing],
+        "orphan_resumes": [str(f) for f in orphans],
+    }
+    json_path.write_text(json.dumps(payload, indent=2))
+    print(f"  JSON summary written: {json_path}")
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -198,6 +226,9 @@ def main():
                      help="Folder containing resume files (default: '../Resumes' next to --aiupkeep-dir)")
     ap.add_argument("--dry-run", action="store_true",
                      help="Report everything without deleting files or writing changes")
+    ap.add_argument("--json-summary", default=None,
+                     help="Path to also write a machine-readable JSON summary "
+                          "(for automation tools like n8n, cron scripts, etc.)")
     args = ap.parse_args()
 
     aiupkeep_dir = Path(args.aiupkeep_dir).expanduser().resolve()
@@ -213,9 +244,10 @@ def main():
     print(f"Mode:         {'DRY RUN (nothing will be deleted or written)' if args.dry_run else 'LIVE'}\n")
 
     rows = load_index(index_path)
+    checked = len(rows)
 
     # Stage 1
-    rag_audit(rows, resume_dir)
+    missing, orphans = index_audit(rows, resume_dir)
 
     # Stage 2
     kept_rows, removed_count = check_and_clean(rows, args.dry_run)
@@ -233,6 +265,17 @@ def main():
     print(f"  Applications currently tracked as active: {final_count}")
     if removed_count:
         print(f"  ({removed_count} closed application(s) cleaned up this run)")
+
+    if args.json_summary:
+        write_json_summary(
+            Path(args.json_summary).expanduser().resolve(),
+            checked=checked,
+            active=final_count,
+            removed=removed_count,
+            missing=missing,
+            orphans=orphans,
+            dry_run=args.dry_run,
+        )
 
 
 if __name__ == "__main__":

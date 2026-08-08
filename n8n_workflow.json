@@ -1,0 +1,114 @@
+{
+  "name": "AIUpkeep Weekly Check + Ollama Summary",
+  "nodes": [
+    {
+      "id": "sticky-1",
+      "name": "What this does",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -60],
+      "parameters": {
+        "content": "## AIUpkeep automation\n\n1. Runs weekly on a schedule.\n2. Executes AIUpkeep.py, which checks every tracked application's posting status, removes closed ones, and writes a JSON summary.\n3. Sends that JSON to a local Ollama model to write a plain-English summary.\n4. Logs the summary to a file.\n\nSwap the last node for a Slack 'Incoming Webhook' HTTP Request node (POST { \"text\": \"={{$json.summary_text}}\" }) if you'd rather post to Slack than a log file.\n\nBefore running: update the paths in the 'Run AIUpkeep' and 'Log Summary' nodes to match your machine, and make sure Ollama is running locally (`ollama serve`) with a text model pulled (e.g. `ollama pull llama3.2`).",
+        "height": 320,
+        "width": 460
+      }
+    },
+    {
+      "id": "trigger-1",
+      "name": "Weekly Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [280, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "weeksInterval": 1,
+              "triggerAtDay": [1],
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "exec-1",
+      "name": "Run AIUpkeep",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [520, 300],
+      "notes": "Runs the tracker, then cats the JSON summary it wrote so this node's stdout IS the JSON. Update the paths for your machine. Drop --dry-run once you trust it.",
+      "parameters": {
+        "command": "python3 /Users/nicholas/Documents/VSCode/AIUpkeep/AIUpkeep.py --aiupkeep-dir /Users/nicholas/Documents/VSCode/AIUpkeep --resume-dir /Users/nicholas/Documents/VSCode/Resumes --dry-run --json-summary /tmp/aiupkeep_summary.json > /tmp/aiupkeep_log.txt 2>&1; cat /tmp/aiupkeep_summary.json"
+      }
+    },
+    {
+      "id": "code-1",
+      "name": "Parse Summary JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [760, 300],
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.stdout;\nlet summary;\ntry {\n  summary = JSON.parse(raw);\n} catch (e) {\n  summary = { error: \"couldn't parse AIUpkeep JSON output\", raw };\n}\nreturn [{ json: summary }];"
+      }
+    },
+    {
+      "id": "http-1",
+      "name": "Summarize with Ollama",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1000, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"llama3.2\",\n  \"prompt\": \"Write a friendly 2-3 sentence status update about a job application tracker run. Mention how many applications are still active and how many were removed because the posting closed, and flag anything that needs manual attention (missing resume files, unclear postings). Data: \" + JSON.stringify($json),\n  \"stream\": false\n}",
+        "options": {}
+      }
+    },
+    {
+      "id": "code-2",
+      "name": "Extract Summary Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1240, 300],
+      "parameters": {
+        "jsCode": "const text = $input.first().json.response || \"(no response from Ollama)\";\nreturn [{ json: { summary_text: text } }];"
+      }
+    },
+    {
+      "id": "exec-2",
+      "name": "Log Summary",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1480, 300],
+      "notes": "Appends a timestamped line to a local log file. Replace with a Slack/email node if you'd rather be notified than log to disk.",
+      "parameters": {
+        "command": "=echo \"$(date '+%Y-%m-%d %H:%M') - {{$json.summary_text.replace(/\"/g, '\\\\\"')}}\" >> /Users/nicholas/Documents/VSCode/AIUpkeep/n8n_summary_log.md"
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Schedule": {
+      "main": [[{ "node": "Run AIUpkeep", "type": "main", "index": 0 }]]
+    },
+    "Run AIUpkeep": {
+      "main": [[{ "node": "Parse Summary JSON", "type": "main", "index": 0 }]]
+    },
+    "Parse Summary JSON": {
+      "main": [[{ "node": "Summarize with Ollama", "type": "main", "index": 0 }]]
+    },
+    "Summarize with Ollama": {
+      "main": [[{ "node": "Extract Summary Text", "type": "main", "index": 0 }]]
+    },
+    "Extract Summary Text": {
+      "main": [[{ "node": "Log Summary", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
