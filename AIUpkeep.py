@@ -1,235 +1,238 @@
 #!/usr/bin/env python3
 """
-AI File Sorter — uses a local Ollama model to read files, generate a
-summary, pick a category, then sorts the files into category folders
-and writes a summary log (CSV + per-file .summary.txt).
+AIUpkeep — job application tracker upkeep.
 
-Requirements:
-    pip install ollama python-docx PyPDF2
+Three-stage run, in order:
 
-    Ollama must be running locally with a model pulled, e.g.:
-        ollama pull llama3.2
-    (Use a bigger model like llama3.1:8b or mistral for better summaries.)
+  1. RAG AUDIT — every row in Index.xls is checked against the actual
+     filesystem. Any resume the index points to that doesn't exist gets
+     flagged, and any resume sitting in the Resumes folder that no row
+     points to gets flagged too.
 
-Usage:
-    python3 ai_file_sorter.py --source ~/Downloads --dest ~/Sorted --model llama3.2
-    python3 ai_file_sorter.py --source ~/Downloads --dest ~/Sorted --dry-run
+  2. STATUS CHECK + CLEANUP — for every row still in the index, the job
+     posting's Link is requested. A 404 means the posting is gone, so its
+     resume is deleted and its row removed from Index.xls. Any other
+     response is treated as still open and the row is kept. This check is
+     company-agnostic — it works the same way regardless of which ATS or
+     careers site the Link points to.
+
+  3. SUMMARY — count.xls is rewritten to match the number of rows left in
+     Index.xls, and a one-line summary is printed.
 """
 
 import argparse
 import csv
-import json
-import shutil
+import re
 import sys
 from pathlib import Path
 
-import ollama
+import requests
 
-# ---------- text extraction ----------
+USER_AGENT = "Mozilla/5.0"  # some ATS platforms block the default requests UA
+REQUEST_TIMEOUT = 10
 
-def extract_text(path: Path, max_chars: int = 6000) -> str:
-    """Pull readable text out of a file. Returns '' if we can't read it."""
-    suffix = path.suffix.lower()
+INDEX_FIELDS = ["Company", "Link", "File Address"]
 
+
+# ---------------------------------------------------------------------------
+# Index / count I/O  (plain CSV, just wearing an .xls extension)
+# ---------------------------------------------------------------------------
+
+def load_index(index_path: Path) -> list[dict]:
+    if not index_path.exists():
+        print(f"[error] Index file not found: {index_path}")
+        sys.exit(1)
+
+    with open(index_path, newline="") as fh:
+        reader = csv.DictReader(fh, skipinitialspace=True)
+        rows = []
+        for raw in reader:
+            row = {k.strip(): (v.strip() if v else "") for k, v in raw.items() if k}
+            rows.append(row)
+    return rows
+
+
+def save_index(index_path: Path, rows: list[dict]):
+    with open(index_path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(INDEX_FIELDS)
+        for row in rows:
+            writer.writerow([row.get(f, "") for f in INDEX_FIELDS])
+
+
+def load_count(count_path: Path) -> int:
+    if not count_path.exists():
+        return 0
+    with open(count_path) as fh:
+        content = fh.read().strip()
+    match = re.search(r"count\s*,\s*(-?\d+)", content, re.IGNORECASE)
+    return int(match.group(1)) if match else 0
+
+
+def save_count(count_path: Path, value: int):
+    with open(count_path, "w") as fh:
+        fh.write(f"count, {value}")
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 — RAG audit: index vs. filesystem
+# ---------------------------------------------------------------------------
+
+def rag_audit(rows: list[dict], resume_dir: Path):
+    print("=== Stage 1: RAG audit (index vs. filesystem) ===")
+
+    indexed_paths = set()
+    missing = []
+    for row in rows:
+        addr = row.get("File Address", "")
+        if not addr:
+            continue
+        path = Path(addr).expanduser()
+        indexed_paths.add(str(path.resolve()) if path.exists() else str(path))
+        if not path.exists():
+            missing.append(row)
+
+    if missing:
+        print(f"  [!] {len(missing)} row(s) point to a resume that no longer exists:")
+        for row in missing:
+            print(f"      - {row.get('Company', '?')}: {row.get('File Address', '?')}")
+    else:
+        print("  All indexed resumes are present on disk.")
+
+    orphans = []
+    if resume_dir.is_dir():
+        for f in resume_dir.iterdir():
+            if not f.is_file():
+                continue
+            if str(f.resolve()) not in indexed_paths:
+                orphans.append(f)
+
+    if orphans:
+        print(f"  [!] {len(orphans)} resume(s) in {resume_dir} aren't referenced by any row:")
+        for f in orphans:
+            print(f"      - {f.name}")
+    elif resume_dir.is_dir():
+        print("  Every resume in the resume folder is accounted for.")
+    else:
+        print(f"  [!] Resume folder not found: {resume_dir}")
+
+    print()
+    return missing, orphans
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 — job status checking
+# ---------------------------------------------------------------------------
+
+def check_job_status(link: str) -> str:
+    """
+    Company-agnostic status check: a 404 means the posting is gone (closed);
+    any other response (200, redirects the requests library already followed,
+    3xx that resolved, etc.) is treated as still active.
+
+    A network error (timeout, DNS failure, connection refused) isn't a 404,
+    so it's treated as 'open' too — a transient error shouldn't delete a
+    resume for a job that might still be live.
+    """
+    headers = {"User-Agent": USER_AGENT}
     try:
-        if suffix in {".txt", ".md", ".csv", ".json", ".py", ".js", ".html",
-                       ".css", ".yaml", ".yml", ".log"}:
-            return path.read_text(errors="ignore")[:max_chars]
+        resp = requests.get(link, headers=headers, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as e:
+        print(f"      [warn] network error checking posting, treating as still open: {e}")
+        return "open"
 
-        if suffix == ".pdf":
-            from PyPDF2 import PdfReader
-            reader = PdfReader(str(path))
-            text = ""
-            for page in reader.pages[:10]:  # cap pages for speed
-                text += page.extract_text() or ""
-                if len(text) >= max_chars:
-                    break
-            return text[:max_chars]
-
-        if suffix == ".docx":
-            import docx
-            doc = docx.Document(str(path))
-            text = "\n".join(p.text for p in doc.paragraphs)
-            return text[:max_chars]
-
-        # Images: send to a vision model separately (see describe_image)
-        if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
-            return ""  # handled separately
-
-    except Exception as e:
-        print(f"  [warn] couldn't extract text from {path.name}: {e}")
-
-    return ""
+    return "closed" if resp.status_code == 404 else "open"
 
 
-def describe_image(path: Path, vision_model: str) -> str:
-    """Use a vision-capable Ollama model (e.g. llava) to describe an image."""
-    try:
-        resp = ollama.chat(
-            model=vision_model,
-            messages=[{
-                "role": "user",
-                "content": "Describe this image's content in 2-3 sentences.",
-                "images": [str(path)],
-            }],
-        )
-        return resp["message"]["content"]
-    except Exception as e:
-        print(f"  [warn] vision model failed on {path.name}: {e}")
-        return ""
+# ---------------------------------------------------------------------------
+# Stage 2 continued — apply cleanup
+# ---------------------------------------------------------------------------
 
+def check_and_clean(rows: list[dict], dry_run: bool) -> list[dict]:
+    print("=== Stage 2: checking posting status ===")
+    kept = []
+    removed = 0
 
-# ---------- LLM classification ----------
+    for row in rows:
+        company = row.get("Company", "?")
+        link = row.get("Link", "")
+        addr = row.get("File Address", "")
+        print(f"  {company}: {link}")
 
-CATEGORIES = [
-    "Invoices & Receipts", "Contracts & Legal", "Reports & Presentations",
-    "Code & Scripts", "Images & Media", "Personal Notes",
-    "Correspondence & Emails", "Reference & Manuals", "Other",
-]
+        if not link:
+            print("      [warn] no link on this row — keeping, can't verify status")
+            kept.append(row)
+            continue
 
-PROMPT_TEMPLATE = """You are a file organizing assistant. Given a file name and
-its extracted content, respond with STRICT JSON only, no extra text, in this
-exact shape:
+        status = check_job_status(link)
 
-{{"category": "<one of: {categories}>", "summary": "<one sentence, max 25 words>"}}
-
-Filename: {filename}
-Content:
-\"\"\"
-{content}
-\"\"\"
-"""
-
-def classify(model: str, filename: str, content: str) -> dict:
-    prompt = PROMPT_TEMPLATE.format(
-        categories=", ".join(CATEGORIES),
-        filename=filename,
-        content=content[:4000] if content else "(no extractable text)",
-    )
-    resp = ollama.chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        options={"temperature": 0.2},
-    )
-    raw = resp["message"]["content"].strip()
-
-    # Models sometimes wrap JSON in ```json fences — strip those.
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        raw = raw.split("\n", 1)[-1] if raw.lower().startswith("json") else raw
-
-    try:
-        data = json.loads(raw)
-        if data.get("category") not in CATEGORIES:
-            data["category"] = "Other"
-        return data
-    except json.JSONDecodeError:
-        return {"category": "Other", "summary": raw[:150] or "Could not summarize."}
-
-
-# ---------- main sort routine ----------
-
-def sort_files(source: Path, dest: Path, model: str, vision_model: str,
-                dry_run: bool):
-    dest.mkdir(parents=True, exist_ok=True)
-    log_path = dest / "sort_log.csv"
-    rows = []
-
-    files = [f for f in source.rglob("*") if f.is_file()]
-    print(f"Found {len(files)} files in {source}\n")
-
-    for i, f in enumerate(files, 1):
-        print(f"[{i}/{len(files)}] {f.name}")
-
-        if f.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
-            content = describe_image(f, vision_model)
+        if status == "closed":
+            print("      -> CLOSED. Removing row" + (" and deleting resume" if addr else "") + (" (dry run)" if dry_run else ""))
+            if addr:
+                path = Path(addr).expanduser()
+                if path.exists():
+                    if not dry_run:
+                        path.unlink()
+                    print(f"      -> {'would delete' if dry_run else 'deleted'}: {path}")
+                else:
+                    print(f"      -> resume already missing, nothing to delete: {path}")
+            removed += 1
+            # row dropped, not appended to kept
         else:
-            content = extract_text(f)
+            print("      -> still open. Keeping.")
+            kept.append(row)
 
-        result = classify(model, f.name, content)
-        category = result.get("category", "Other")
-        summary = result.get("summary", "")
-
-        target_dir = dest / category
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = target_dir / f.name
-
-        print(f"  -> {category}: {summary}")
-
-        if not dry_run:
-            shutil.move(str(f), str(target_path))
-            (target_dir / f"{f.stem}.summary.txt").write_text(summary)
-
-        rows.append({
-            "original_path": str(f),
-            "new_path": str(target_path),
-            "category": category,
-            "summary": summary,
-        })
-
-    with open(log_path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["original_path", "new_path",
-                                                  "category", "summary"])
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"\nDone. Log written to {log_path}")
-    if dry_run:
-        print("(dry run — no files were actually moved)")
+    print()
+    return kept, removed
 
 
-def prompt_path(message: str, must_exist: bool = False) -> Path:
-    """Ask the user for a folder path on the command line, retrying on bad input."""
-    while True:
-        raw = input(message).strip().strip('"').strip("'")
-        if not raw:
-            print("  Please enter a path.")
-            continue
-        path = Path(raw).expanduser().resolve()
-        if must_exist and not path.is_dir():
-            print(f"  That folder doesn't exist: {path}")
-            continue
-        return path
-
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="AI file sorter using Ollama")
-    ap.add_argument("--source", help="Folder to sort (skips the prompt if given)")
-    ap.add_argument("--dest", help="Where sorted folders go (skips the prompt if given)")
-    ap.add_argument("--model", default="llama3.2", help="Ollama text model")
-    ap.add_argument("--vision-model", default="llava",
-                     help="Ollama vision model for images")
+    ap = argparse.ArgumentParser(description="Audit, verify, and clean up the job application index")
+    ap.add_argument("--aiupkeep-dir", default=".",
+                     help="Folder containing Index.xls and count.xls (default: current dir)")
+    ap.add_argument("--resume-dir", default=None,
+                     help="Folder containing resume files (default: '../Resumes' next to --aiupkeep-dir)")
     ap.add_argument("--dry-run", action="store_true",
-                     help="Preview categorization without moving files")
+                     help="Report everything without deleting files or writing changes")
     args = ap.parse_args()
 
-    # If --source/--dest weren't passed on the command line, ask for them
-    # interactively so the script can just be run with `python3 ai_file_sorter.py`.
-    if args.source:
-        source = Path(args.source).expanduser().resolve()
-        if not source.is_dir():
-            print(f"Source folder not found: {source}")
-            sys.exit(1)
-    else:
-        source = prompt_path("Folder to sort (source): ", must_exist=True)
+    aiupkeep_dir = Path(args.aiupkeep_dir).expanduser().resolve()
+    resume_dir = (Path(args.resume_dir).expanduser().resolve() if args.resume_dir
+                  else (aiupkeep_dir.parent / "Resumes").resolve())
+    index_path = aiupkeep_dir / "Index.xls"
+    count_path = aiupkeep_dir / "count.xls"
 
-    if args.dest:
-        dest = Path(args.dest).expanduser().resolve()
-    else:
-        default_dest = source.parent / f"{source.name}_sorted"
-        raw_dest = input(f"Destination folder [{default_dest}]: ").strip()
-        dest = Path(raw_dest).expanduser().resolve() if raw_dest else default_dest
+    print(f"AIUpKeep dir: {aiupkeep_dir}")
+    print(f"Resume dir:   {resume_dir}")
+    print(f"Index file:   {index_path}")
+    print(f"Count file:   {count_path}")
+    print(f"Mode:         {'DRY RUN (nothing will be deleted or written)' if args.dry_run else 'LIVE'}\n")
 
-    dry_run = args.dry_run
+    rows = load_index(index_path)
+
+    # Stage 1
+    rag_audit(rows, resume_dir)
+
+    # Stage 2
+    kept_rows, removed_count = check_and_clean(rows, args.dry_run)
+
     if not args.dry_run:
-        answer = input("Do a dry run first (no files moved)? [Y/n]: ").strip().lower()
-        dry_run = answer in ("", "y", "yes")
+        save_index(index_path, kept_rows)
+        save_count(count_path, len(kept_rows))
+    else:
+        print(f"  (dry run — would remove {removed_count} row(s), "
+              f"leaving {len(kept_rows)}; index and count files left untouched)\n")
 
-    print(f"\nSource: {source}")
-    print(f"Dest:   {dest}")
-    print(f"Mode:   {'DRY RUN' if dry_run else 'LIVE (files will be moved)'}\n")
-
-    sort_files(source, dest, args.model, args.vision_model, dry_run)
+    # Stage 3 — summary, from the count value
+    final_count = len(kept_rows) if not args.dry_run else load_count(count_path)
+    print("=== Stage 3: summary ===")
+    print(f"  Applications currently tracked as active: {final_count}")
+    if removed_count:
+        print(f"  ({removed_count} closed application(s) cleaned up this run)")
 
 
 if __name__ == "__main__":
